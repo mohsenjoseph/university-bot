@@ -54,4 +54,12 @@ protected $casts = [
 {
     return $this->belongsTo(User::class, 'assigned_expert_id');
 }
+
+    /**
+     * تاریخچه کامل مراحل ارجاع این درخواست، به ترتیب وقوع.
+     */
+    public function referrals()
+    {
+        return $this->hasMany(RequestReferral::class, 'request_id')->orderBy('step_no');
+    }
 }

@@ -4,10 +4,12 @@ namespace App\Http\Controllers\Panel;
 
 use App\Http\Controllers\Controller;
 use App\Models\RequestModel;
+use App\Models\RequestReferral;
 use App\Models\User;
 use App\Models\Department;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
 
 class ReportController extends Controller
 {
@@ -21,12 +23,14 @@ class ReportController extends Controller
         if ($user->role === 'admin') {
             $expertReports     = $this->buildExpertReport($fromDate, $toDate);
             $departmentReports = $this->buildDepartmentReport($fromDate, $toDate);
+            $referralReports   = $this->buildReferralReport($fromDate, $toDate);
         } else {
             $expertReports     = $this->buildExpertReport($fromDate, $toDate, $user->id);
             $departmentReports = collect();
+            $referralReports   = $this->buildReferralReport($fromDate, $toDate, $user->id);
         }
 
-        return view('panel.reports', compact('expertReports', 'departmentReports', 'fromDate', 'toDate', 'user'));
+        return view('panel.reports', compact('expertReports', 'departmentReports', 'referralReports', 'fromDate', 'toDate', 'user'));
     }
 
     private function buildExpertReport(string $fromDate, string $toDate, ?int $onlyExpertId = null)
@@ -98,5 +102,72 @@ class ReportController extends Controller
                 'total'         => (clone $base)->count(),
             ];
         });
+    }
+
+    /**
+     * گزارش تحلیلی ارجاع‌ها بر اساس جدول request_referrals:
+     * - تعداد ارجاع داده‌شده و گرفته‌شده توسط هر کارشناس
+     * - میانگین زمانی که هر درخواست نزد یک کارشناس مانده (به ساعت)
+     * - طولانی‌ترین مسیر ارجاع (بیشترین تعداد مرحله) در بازه انتخابی
+     */
+    private function buildReferralReport(string $fromDate, string $toDate, ?int $onlyExpertId = null)
+    {
+        $stepsQuery = RequestReferral::query()
+            ->whereDate('started_at', '>=', $fromDate)
+            ->whereDate('started_at', '<=', $toDate);
+
+        if ($onlyExpertId) {
+            $stepsQuery->where(function ($q) use ($onlyExpertId) {
+                $q->where('from_expert_id', $onlyExpertId)
+                  ->orWhere('to_expert_id', $onlyExpertId);
+            });
+        }
+
+        $steps = $stepsQuery->get();
+
+        $sentByExpert = $steps->whereNotNull('from_expert_id')
+            ->groupBy('from_expert_id')
+            ->map->count();
+
+        $receivedByExpert = $steps->groupBy('to_expert_id')->map->count();
+
+        $expertIds = $sentByExpert->keys()->merge($receivedByExpert->keys())->unique();
+
+        $perExpert = $expertIds->map(function ($expertId) use ($sentByExpert, $receivedByExpert) {
+            $expert = User::find($expertId);
+            return [
+                'expert_id' => $expertId,
+                'name'      => $expert?->name ?? '-',
+                'sent'      => $sentByExpert->get($expertId, 0),
+                'received'  => $receivedByExpert->get($expertId, 0),
+            ];
+        })->values();
+
+        // میانگین مدت زمان هر مرحله (فقط مراحلی که بسته شده‌اند، یعنی closed_at دارند)
+        $closedSteps = $steps->whereNotNull('closed_at');
+        $avgStepHours = $closedSteps->isNotEmpty()
+            ? round($closedSteps->avg(fn ($s) => $s->started_at->diffInMinutes($s->closed_at)) / 60, 1)
+            : null;
+
+        // طولانی‌ترین مسیر ارجاع در بازه: درخواستی با بیشترین step_no
+        $longestChain = RequestReferral::query()
+            ->whereDate('started_at', '>=', $fromDate)
+            ->whereDate('started_at', '<=', $toDate)
+            ->select('request_id', DB::raw('MAX(step_no) as max_step'))
+            ->groupBy('request_id')
+            ->orderByDesc('max_step')
+            ->first();
+
+        $longestChainRequest = $longestChain
+            ? RequestModel::find($longestChain->request_id)
+            : null;
+
+        return [
+            'per_expert'            => $perExpert,
+            'avg_step_hours'        => $avgStepHours,
+            'longest_chain_steps'   => $longestChain?->max_step,
+            'longest_chain_request' => $longestChainRequest,
+            'total_referral_steps'  => $steps->count(),
+        ];
     }
 }
